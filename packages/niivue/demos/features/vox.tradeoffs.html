@@ -61,8 +61,8 @@
   var nv1
   const volumeList1 = [
     { url: "../images/mni152.nii.gz"},
-    {url: "../images/aal.nii.gz"},
     { url: "../images/stats.nv_demo_mskd.nii.gz", colormap: "warm", colormapNegative: "winter", frame4D: 1, cal_min: 3.3641, cal_max: 6},
+    {url: "../images/aal.nii.gz"},
   ]
   async function fetchJSON(fnm) {
     const response = await fetch(fnm)
@@ -82,10 +82,10 @@
     nv1.setVolumeRenderIllumination(this.value)
   }
   atlasSlider.oninput = function () {
-    nv1.setOpacity(1, this.value / 255.0)
+    nv1.setOpacity(2, this.value / 255.0)
   }
   statSlider.oninput = function () {
-    nv1.setOpacity(2, this.value / 255.0)
+    nv1.setOpacity(1, this.value / 255.0)
   }
   aaCheck.onclick = async function () {
     const isAntiAlias = this.checked
@@ -104,10 +104,10 @@
     nv1.opts.multiplanarShowRender = niivue.SHOW_RENDER.ALWAYS
     await nv1.loadVolumes(volumeList1)
     let cmap = await fetchJSON("../images/aal.json")
-    nv1.volumes[1].setColormapLabel(cmap)
+    nv1.volumes[2].setColormapLabel(cmap)
     nv1.setSliceType(nv1.sliceTypeMultiplanar)
     nv1.volumes[0].colorbarVisible = false; //hide colorbar for anatomical scan
-    nv1.volumes[1].colorbarVisible = false; //hide colorbar for atlas
+    nv1.volumes[2].colorbarVisible = false; //hide colorbar for atlas
     nv1.opts.isColorbar = true
     dpiCheck.onclick()
     renderMode.onchange()
