@@ -1,6 +1,11 @@
 import { mat4, vec3, vec4, vec2 } from 'gl-matrix';
 import { NIFTI1, NIFTI2, NIFTIEXTENSION } from 'nifti-reader-js';
 
+declare enum COLORMAP_TYPE {
+    MIN_TO_MAX = 0,
+    ZERO_TO_MAX_TRANSPARENT_BELOW_MIN = 1,
+    ZERO_TO_MAX_TRANSLUCENT_BELOW_MIN = 2
+}
 type ColorMap = {
     R: number[];
     G: number[];
@@ -235,6 +240,13 @@ type ImageFromUrlOptions = {
     isManifest?: boolean;
     urlImgData?: string;
     buffer?: ArrayBuffer;
+    zarrLevel?: number;
+    zarrMaxVolumeSize?: number;
+    zarrChannel?: number;
+    /** Convert OME spatial units to millimeters for NIfTI compatibility (default: true) */
+    zarrConvertUnits?: boolean;
+    /** World-space center [x, y, z] in mm where the zarr volume center should be positioned */
+    zarrCenterMM?: [number, number, number];
 };
 type ImageFromFileOptions = {
     file: File | File[];
@@ -287,7 +299,412 @@ type ImageMetadata = {
 };
 declare const NVImageFromUrlOptions: (url: string, urlImageData?: string, name?: string, colormap?: string, opacity?: number, cal_min?: number, cal_max?: number, trustCalMinMax?: boolean, percentileFrac?: number, ignoreZeroVoxels?: boolean, useQFormNotSForm?: boolean, colormapNegative?: string, frame4D?: number, imageType?: ImageType, cal_minNeg?: number, cal_maxNeg?: number, colorbarVisible?: boolean, alphaThreshold?: boolean, colormapLabel?: any) => ImageFromUrlOptions;
 
-type TypedVoxelArray = Float32Array | Uint8Array | Int16Array | Float64Array | Uint16Array;
+/**
+ * ZarrChunkCache - LRU cache for zarr chunks (TypedArrays).
+ *
+ * LRU cache that stores TypedArrays.
+ * TypedArrays are garbage collected automatically, so no explicit cleanup needed.
+ */
+type TypedArray = Uint8Array | Uint16Array | Int16Array | Int32Array | Uint32Array | Float32Array | Float64Array;
+declare class ZarrChunkCache {
+    private cache;
+    private loadingSet;
+    private maxChunks;
+    constructor(maxChunks?: number);
+    /**
+     * Generate a unique key for a chunk.
+     * Format: "name:level/x/y" for 2D or "name:level/x/y/z" for 3D
+     */
+    static getKey(name: string, level: number, x: number, y: number, z?: number): string;
+    /**
+     * Check if a chunk is in the cache
+     */
+    has(key: string): boolean;
+    /**
+     * Get a chunk from the cache.
+     * Also moves the entry to the end (most recently used).
+     */
+    get(key: string): TypedArray | undefined;
+    /**
+     * Store a chunk in the cache.
+     * Evicts oldest entries if capacity is exceeded.
+     */
+    set(key: string, chunk: TypedArray): void;
+    /**
+     * Check if a chunk is currently being loaded
+     */
+    isLoading(key: string): boolean;
+    /**
+     * Mark a chunk as loading (to prevent duplicate requests)
+     */
+    startLoading(key: string): void;
+    /**
+     * Mark a chunk as done loading
+     */
+    doneLoading(key: string): void;
+    /**
+     * Get the number of cached chunks
+     */
+    get size(): number;
+    /**
+     * Get the number of chunks currently loading
+     */
+    get loadingCount(): number;
+    /**
+     * Clear the entire cache
+     */
+    clear(): void;
+    /**
+     * Delete a specific chunk from cache
+     */
+    delete(key: string): boolean;
+    /**
+     * Get all cached keys
+     */
+    keys(): IterableIterator<string>;
+}
+
+/**
+ * ZarrChunkClient - HTTP client for fetching zarr array data using zarrita.js.
+ *
+ * Handles pyramid discovery and chunk fetching for OME-ZARR and regular zarr stores.
+ */
+
+interface ZarrChunkClientConfig {
+    /** Base URL for zarr store (e.g., "http://localhost:8090/lightsheet.zarr") */
+    baseUrl: string;
+}
+interface ZarrPyramidLevel {
+    /** Level index (0 = highest resolution) */
+    index: number;
+    /** Path to this level in the zarr hierarchy (e.g., "/0", "/1") */
+    path: string;
+    /** Spatial-only shape in OME metadata order (non-spatial dims stripped) */
+    shape: number[];
+    /** Spatial-only chunk dimensions matching shape order */
+    chunks: number[];
+    /** Data type (e.g., "uint8", "uint16", "float32") */
+    dtype: string;
+    /** Physical scale factors per spatial axis in OME metadata order from coordinateTransformations */
+    scales?: number[];
+    /** Physical translation offsets per spatial axis in OME metadata order from coordinateTransformations */
+    translations?: number[];
+}
+/**
+ * Mapping from spatial chunk coordinates to full zarr array chunk coordinates.
+ * Handles non-spatial dimensions like channel (c) and time (t).
+ */
+interface AxisMapping {
+    /** Total number of dimensions in the original zarr array */
+    originalNdim: number;
+    /** Indices of spatial axes in the original array, in OME metadata order */
+    spatialIndices: number[];
+    /** Names of spatial axes in OME metadata order (e.g., ['x', 'y', 'z'] or ['z', 'y', 'x']) */
+    spatialAxisNames: string[];
+    /** Non-spatial axes: their index in the original array, chunk size, and default chunk coord */
+    nonSpatialAxes: Array<{
+        index: number;
+        name: string;
+        chunkSize: number;
+        defaultChunkCoord: number;
+    }>;
+}
+interface ZarrPyramidInfo {
+    /** Name/URL of the zarr store */
+    name: string;
+    /** Pyramid levels (index 0 = highest resolution) */
+    levels: ZarrPyramidLevel[];
+    /** Whether this is a 3D dataset (based on spatial dimensions) */
+    is3D: boolean;
+    /** Number of spatial dimensions (2 or 3) */
+    ndim: number;
+    /** Mapping from spatial to full array coordinates */
+    axisMapping: AxisMapping;
+    /** Units for spatial axes in OME metadata order (e.g., "micrometer", "millimeter") */
+    spatialUnits?: string[];
+}
+interface ChunkCoord {
+    /** Pyramid level */
+    level: number;
+    /** Chunk X index */
+    x: number;
+    /** Chunk Y index */
+    y: number;
+    /** Chunk Z index (for 3D) */
+    z?: number;
+}
+declare class ZarrChunkClient {
+    private store;
+    private baseUrl;
+    private arrays;
+    /** Maps level index to actual path in the zarr store */
+    private levelPaths;
+    /** Axis mapping for coordinate translation */
+    private axisMapping;
+    constructor(config: ZarrChunkClientConfig);
+    /**
+     * Discover pyramid structure by reading OME-ZARR multiscales metadata,
+     * or falling back to probing for arrays at /0, /1, /2, etc.
+     */
+    fetchInfo(): Promise<ZarrPyramidInfo>;
+    /**
+     * Build axis mapping from OME axes metadata or infer from array dimensions.
+     * Identifies spatial (x, y, z) vs non-spatial (c, t) dimensions and returns
+     * indices for extracting spatial-only shape/chunks.
+     * Spatial indices are kept in the original OME metadata order (NOT reordered).
+     */
+    private buildAxisMapping;
+    /**
+     * Open a zarr array at a specific pyramid level.
+     * Uses cached arrays when available.
+     */
+    private openLevel;
+    /**
+     * Fetch a single chunk by spatial coordinates.
+     * Uses the axis mapping to build full chunk coordinates including non-spatial dims.
+     * Returns the spatial-only decoded TypedArray data.
+     *
+     * @param level - Pyramid level
+     * @param x - Spatial X chunk index
+     * @param y - Spatial Y chunk index
+     * @param z - Spatial Z chunk index (for 3D)
+     * @param nonSpatialCoords - Optional overrides for non-spatial dimensions (e.g., channel index)
+     */
+    fetchChunk(level: number, x: number, y: number, z?: number, nonSpatialCoords?: Record<string, number>, signal?: AbortSignal): Promise<TypedArray | null>;
+    /**
+     * Fetch multiple chunks in parallel.
+     * Returns a Map from chunk key to TypedArray.
+     */
+    fetchChunks(name: string, level: number, coords: ChunkCoord[]): Promise<Map<string, TypedArray>>;
+    /**
+     * Fetch a rectangular region using zarr.get with slices.
+     * Useful for fetching exact viewport regions rather than whole chunks.
+     * Uses axis mapping to handle non-spatial dimensions.
+     */
+    fetchRegion(level: number, region: {
+        xStart: number;
+        xEnd: number;
+        yStart: number;
+        yEnd: number;
+        zStart?: number;
+        zEnd?: number;
+    }): Promise<{
+        data: TypedArray;
+        shape: number[];
+    } | null>;
+    /**
+     * Get the zarr store URL
+     */
+    getUrl(): string;
+    /**
+     * Clear cached array references
+     */
+    clearArrayCache(): void;
+}
+
+/**
+ * NVZarrHelper - Simplified zarr chunk management for NVImage.
+ *
+ * Attaches to a host NVImage and manages chunked loading of OME-Zarr data.
+ * No zoom, no prefetching - just pan and level switching.
+ * All coordinates are in current-level pixel space.
+ *
+ * Spatial dimensions are kept in OME metadata order throughout.
+ * The mapping to NIfTI layout is:
+ *   - OME dim[0] (slowest in C-order) → NIfTI dim 3 (depth, slowest in Fortran-order)
+ *   - OME dim[1]                       → NIfTI dim 2 (height)
+ *   - OME dim[2] (fastest in C-order)  → NIfTI dim 1 (width, fastest in Fortran-order)
+ * This means chunk data can be copied directly without stride remapping.
+ * The affine matrix maps NIfTI (i, j, k) indices to physical (x, y, z) space
+ * using the OME axis names.
+ */
+
+interface NVZarrHelperOptions {
+    url: string;
+    level: number;
+    maxVolumeSize?: number;
+    maxTextureSize?: number;
+    channel?: number;
+    cacheSize?: number;
+    /** Convert OME spatial units to millimeters for NIfTI compatibility (default: true) */
+    convertUnitsToMm?: boolean;
+}
+declare class NVZarrHelper {
+    private hostImage;
+    private chunkClient;
+    private chunkCache;
+    private pyramidInfo;
+    private datatypeCode;
+    private pyramidLevel;
+    /** Level dimensions in OME metadata order: depth=dim[0], height=dim[1], width=dim[2] */
+    private levelDims;
+    private volumeDims;
+    private chunkSize;
+    /** Voxel scales in OME metadata order: depth=dim[0], height=dim[1], width=dim[2] */
+    private voxelScales;
+    /** Voxel translations in OME metadata order */
+    private voxelTranslations;
+    private hasTranslations;
+    private convertUnitsToMm;
+    private worldOffsetMM;
+    private centerX;
+    private centerY;
+    private centerZ;
+    private channel;
+    private nonSpatialCoords;
+    private isUpdating;
+    private needsUpdate;
+    private currentAbortController;
+    private runningMin;
+    private runningMax;
+    private calibrationDone;
+    private updateDebounceTimer;
+    private readonly UPDATE_DEBOUNCE_MS;
+    private pendingChunkCount;
+    private lastRenderedChunkCount;
+    centerAtDragStart: {
+        x: number;
+        y: number;
+        z: number;
+    } | null;
+    onChunksUpdated?: () => void;
+    onAllChunksLoaded?: () => void;
+    private constructor();
+    static create(hostImage: NVImage, url: string, options: NVZarrHelperOptions): Promise<NVZarrHelper>;
+    loadInitialChunks(): Promise<void>;
+    private updateLevelInfo;
+    private configureHostImage;
+    /** Get unit-converted voxel scales */
+    private getConvertedScales;
+    /** Get unit-converted voxel translations */
+    private getConvertedTranslations;
+    /**
+     * Build the NIfTI affine from OME axis names, scales, and translations.
+     *
+     * NIfTI dimensions map to OME spatial dimensions as:
+     *   i (dim 1, width)  = OME spatial[-1] (last, fastest in C-order)
+     *   j (dim 2, height) = OME spatial[-2]
+     *   k (dim 3, depth)  = OME spatial[-3] (first, slowest in C-order)
+     *
+     * The affine maps (i, j, k) → physical (x, y, z):
+     *   physical_axis = scale * nifti_dim + translation
+     * where nifti_dim is the column index (0=i, 1=j, 2=k) and
+     * physical_axis row is determined by the OME axis name.
+     */
+    private updateAffine;
+    beginDrag(): void;
+    endDrag(): void;
+    panBy(dx: number, dy: number, dz?: number): Promise<void>;
+    panTo(newCenterX: number, newCenterY: number, newCenterZ?: number): Promise<void>;
+    setPyramidLevel(level: number): Promise<void>;
+    getViewportState(): {
+        centerX: number;
+        centerY: number;
+        centerZ: number;
+        level: number;
+    };
+    getPyramidInfo(): ZarrPyramidInfo;
+    getPyramidLevel(): number;
+    getLevelDims(): {
+        width: number;
+        height: number;
+        depth: number;
+    };
+    getVolumeDims(): {
+        width: number;
+        height: number;
+        depth: number;
+    };
+    getWorldOffset(): [number, number, number];
+    /**
+     * Set the world-space offset so the full level's center maps to targetMM in world space.
+     * Computes the native physical center of the zarr level, then sets worldOffsetMM
+     * so that center aligns with targetMM. Also centers the viewport on the level center.
+     */
+    setWorldCenter(targetMM: [number, number, number]): void;
+    /**
+     * Convert physical (mm) coordinates back to real zarr level pixel coordinates.
+     * Inverts the affine: levelPixel = (mm - OME_translation) / scale
+     */
+    mmToLevelCoords(mmX: number, mmY: number, mmZ: number): {
+        width: number;
+        height: number;
+        depth: number;
+        level: number;
+        levelDims: {
+            width: number;
+            height: number;
+            depth: number;
+        };
+    };
+    private clampCenter;
+    private getVisibleChunks;
+    private updateVolume;
+    private clearVolumeData;
+    private assembleVisibleChunks;
+    private assembleChunkIntoVolume;
+    private updateCalibration;
+    /**
+     * Schedule a debounced chunks update callback.
+     * Batches multiple chunk arrivals within UPDATE_DEBOUNCE_MS into a single GPU update.
+     */
+    private scheduleChunksUpdated;
+    clearCache(): void;
+    refresh(): Promise<void>;
+}
+
+/**
+ * Represents an affine transformation in decomposed form.
+ */
+interface AffineTransform {
+    translation: [number, number, number];
+    rotation: [number, number, number];
+    scale: [number, number, number];
+}
+/**
+ * Identity transform with no translation, rotation, or scale change.
+ */
+declare const identityTransform: AffineTransform;
+/**
+ * Convert degrees to radians.
+ */
+declare function degToRad(degrees: number): number;
+/**
+ * Create a rotation matrix from Euler angles (XYZ order).
+ * Angles are in degrees.
+ */
+declare function eulerToRotationMatrix(rx: number, ry: number, rz: number): mat4;
+/**
+ * Create a 4x4 transformation matrix from decomposed transform components.
+ * Order: Scale -> Rotate -> Translate
+ */
+declare function createTransformMatrix(transform: AffineTransform): mat4;
+/**
+ * Convert a 2D array (row-major, as used by NIfTI) to gl-matrix mat4 (column-major).
+ */
+declare function arrayToMat4(arr: number[][]): mat4;
+/**
+ * Convert gl-matrix mat4 (column-major) to 2D array (row-major, as used by NIfTI).
+ */
+declare function mat4ToArray(m: mat4): number[][];
+/**
+ * Multiply a transformation matrix by an affine matrix (as 2D array).
+ * Returns the result as a 2D array.
+ *
+ * The transform is applied to the left: result = transform * original
+ * This means the transform happens in world coordinate space.
+ */
+declare function multiplyAffine(original: number[][], transform: mat4): number[][];
+/**
+ * Deep copy a 2D affine matrix array.
+ */
+declare function copyAffine(affine: number[][]): number[][];
+/**
+ * Check if two transforms are approximately equal.
+ */
+declare function transformsEqual(a: AffineTransform, b: AffineTransform, epsilon?: number): boolean;
+
+type TypedVoxelArray = Float32Array | Uint8Array | Int16Array | Float64Array | Uint16Array | Int32Array | Uint32Array;
 /**
  * a NVImage encapsulates some image data and provides methods to query and operate on images
  */
@@ -343,6 +760,8 @@ declare class NVImage {
     dims?: number[];
     onColormapChange: (img: NVImage) => void;
     onOpacityChange: (img: NVImage) => void;
+    zarrHelper: NVZarrHelper | null;
+    _hasExplicitZarrCenter: boolean;
     mm000?: vec3;
     mm100?: vec3;
     mm010?: vec3;
@@ -356,6 +775,7 @@ declare class NVImage {
     urlImgData?: string;
     isManifest?: boolean;
     limitFrames4D?: number;
+    originalAffine?: number[][];
     constructor(dataBuffer?: ArrayBuffer | ArrayBuffer[] | ArrayBufferLike | null, name?: string, colormap?: string, opacity?: number, pairedImgData?: ArrayBuffer | null, cal_min?: number, cal_max?: number, trustCalMinMax?: boolean, percentileFrac?: number, ignoreZeroVoxels?: boolean, useQFormNotSForm?: boolean, colormapNegative?: string, frame4D?: number, imageType?: ImageType, cal_minNeg?: number, cal_maxNeg?: number, colorbarVisible?: boolean, colormapLabel?: LUT | null, colormapType?: number);
     init(dataBuffer?: ArrayBuffer | ArrayBuffer[] | ArrayBufferLike | null, name?: string, colormap?: string, opacity?: number, _pairedImgData?: ArrayBuffer | null, cal_min?: number, cal_max?: number, trustCalMinMax?: boolean, percentileFrac?: number, ignoreZeroVoxels?: boolean, useQFormNotSForm?: boolean, colormapNegative?: string, frame4D?: number, imageType?: ImageType, cal_minNeg?: number, cal_maxNeg?: number, colorbarVisible?: boolean, colormapLabel?: LUT | null, colormapType?: number, imgRaw?: ArrayBuffer | ArrayBufferLike | null): void;
     static new(dataBuffer: ArrayBuffer | ArrayBuffer[] | ArrayBufferLike | null, name: string, colormap: string, opacity: number, pairedImgData: ArrayBuffer | null, cal_min: number, cal_max: number, trustCalMinMax: boolean, percentileFrac: number, ignoreZeroVoxels: boolean, useQFormNotSForm: boolean, colormapNegative: string, frame4D: number, imageType: ImageType, cal_minNeg: number, cal_maxNeg: number, colorbarVisible: boolean, colormapLabel: LUT | null, colormapType: number, zarrData: null | unknown): Promise<NVImage>;
@@ -377,6 +797,29 @@ declare class NVImage {
     readMHA(buffer: ArrayBuffer, pairedImgData: ArrayBuffer | null): Promise<ArrayBuffer>;
     readMIF(buffer: ArrayBuffer, pairedImgData: ArrayBuffer | null): Promise<ArrayBuffer>;
     calculateRAS(): void;
+    /**
+     * Get a deep copy of the current affine matrix.
+     * @returns A 4x4 affine matrix as a 2D array (row-major)
+     */
+    getAffine(): number[][];
+    /**
+     * Set a new affine matrix and recalculate all derived RAS matrices.
+     * Call updateGLVolume() on the Niivue instance after this to update rendering.
+     * @param affine - A 4x4 affine matrix as a 2D array (row-major)
+     */
+    setAffine(affine: number[][]): void;
+    /**
+     * Apply a transform (translation, rotation, scale) to the current affine matrix.
+     * The transform is applied in world coordinate space: newAffine = transform * currentAffine
+     * Call updateGLVolume() on the Niivue instance after this to update rendering.
+     * @param transform - Transform to apply with translation (mm), rotation (degrees), and scale
+     */
+    applyTransform(transform: AffineTransform): void;
+    /**
+     * Reset the affine matrix to its original state when the image was first loaded.
+     * Call updateGLVolume() on the Niivue instance after this to update rendering.
+     */
+    resetAffine(): void;
     hdr2RAS(nVolumes?: number): Promise<NIFTI1 | NIFTI2>;
     img2RAS(nVolume?: number): TypedVoxelArray;
     vox2mm(XYZ: number[], mtx: mat4): vec3;
@@ -422,8 +865,22 @@ declare class NVImage {
     /**
      * factory function to load and return a new NVImage instance from a given URL
      */
-    static loadFromUrl({ url, urlImgData, headers, name, colormap, opacity, cal_min, cal_max, trustCalMinMax, percentileFrac, ignoreZeroVoxels, useQFormNotSForm, colormapNegative, frame4D, isManifest, limitFrames4D, imageType, colorbarVisible, buffer }?: Partial<Omit<ImageFromUrlOptions, 'url'>> & {
+    static loadFromUrl({ url, urlImgData, headers, name, colormap, opacity, cal_min, cal_max, trustCalMinMax, percentileFrac, ignoreZeroVoxels, useQFormNotSForm, colormapNegative, frame4D, isManifest, limitFrames4D, imageType, colorbarVisible, buffer, zarrLevel, zarrMaxVolumeSize, zarrChannel, zarrConvertUnits, zarrCenterMM }?: Partial<Omit<ImageFromUrlOptions, 'url'>> & {
         url?: string | Uint8Array | ArrayBuffer;
+    }): Promise<NVImage>;
+    /**
+     * Factory method: create a chunked zarr NVImage with an attached NVZarrHelper.
+     */
+    static createChunkedZarr(url: string, options: {
+        level: number;
+        maxVolumeSize?: number;
+        maxTextureSize?: number;
+        channel?: number;
+        cacheSize?: number;
+        convertUnitsToMm?: boolean;
+        colormap?: string;
+        opacity?: number;
+        zarrCenterMM?: [number, number, number];
     }): Promise<NVImage>;
     static readFileAsync(file: File, bytesToLoad?: number): Promise<ArrayBuffer>;
     /**
@@ -645,11 +1102,6 @@ interface TouchEventConfig {
     singleTouch: DRAG_MODE;
     doubleTouch: DRAG_MODE;
 }
-declare enum COLORMAP_TYPE {
-    MIN_TO_MAX = 0,
-    ZERO_TO_MAX_TRANSPARENT_BELOW_MIN = 1,
-    ZERO_TO_MAX_TRANSLUCENT_BELOW_MIN = 2
-}
 /**
  * NVConfigOptions
  */
@@ -762,8 +1214,17 @@ type NVConfigOptions = {
     bounds: [[number, number], [number, number]] | null;
     showBoundsBorder?: boolean;
     boundsBorderColor?: number[];
+    /** Chunk cache size for zarr viewing (default 500) */
+    zarrCacheSize: number;
+    /** Number of chunk rings to prefetch around the visible region for zarr viewing (0 disables, default 1) */
+    zarrPrefetchRings: number;
 };
 declare const DEFAULT_OPTIONS: NVConfigOptions;
+type EncodeNumbersIn<T> = T extends number ? number | string : T extends Array<infer U> ? Array<EncodeNumbersIn<U>> : T extends object ? {
+    [K in keyof T]: EncodeNumbersIn<T[K]>;
+} : T;
+type EncodedNVConfigOptions = EncodeNumbersIn<NVConfigOptions>;
+declare const DEFAULT_SCENE_DATA: {};
 type SceneData = {
     gamma: number;
     azimuth: number;
@@ -800,11 +1261,14 @@ type Scene = {
     _azimuth?: number;
     gamma?: number;
 };
+/**
+ * DocumentData / ExportDocumentData types (kept minimal here)
+ */
 type DocumentData = {
     title?: string;
     imageOptionsArray?: ImageFromUrlOptions[];
     meshOptionsArray?: unknown[];
-    opts?: Partial<NVConfigOptions>;
+    opts?: Partial<EncodedNVConfigOptions> | Partial<NVConfigOptions>;
     previewImageDataURL?: string;
     labels?: NVLabel3D[];
     encodedImageBlobs?: string[];
@@ -817,14 +1281,16 @@ type DocumentData = {
     completedAngles?: CompletedAngle[];
 };
 type ExportDocumentData = {
+    title?: string;
     encodedImageBlobs: string[];
     encodedDrawingBlob: string;
     previewImageDataURL: string;
     imageOptionsMap: Map<string, number>;
     imageOptionsArray: ImageFromUrlOptions[];
     sceneData: Partial<SceneData>;
-    opts: NVConfigOptions;
+    opts: EncodedNVConfigOptions | Partial<EncodedNVConfigOptions>;
     meshesString: string;
+    meshOptionsArray?: unknown[];
     labels: NVLabel3D[];
     connectomes: string[];
     customData: string;
@@ -832,8 +1298,11 @@ type ExportDocumentData = {
     completedAngles: CompletedAngle[];
 };
 /**
- * Creates and instance of NVDocument
- * @ignore
+ * Returns a partial configuration object containing only the fields in the provided
+ * options that differ from the DEFAULT_OPTIONS.
+ */
+/**
+ * NVDocument class (main)
  */
 declare class NVDocument {
     data: DocumentData;
@@ -874,7 +1343,6 @@ declare class NVDocument {
     get encodedImageBlobs(): string[];
     /**
      * Gets the base 64 encoded blob of the associated drawing
-     * TODO the return type was marked as string[] here, was that an error?
      */
     get encodedDrawingBlob(): string;
     /**
@@ -913,8 +1381,6 @@ declare class NVDocument {
     removeImage(image: NVImage): void;
     /**
      * Fetch any image data that is missing from this document.
-     * This includes loading image blobs for `ImageFromUrlOptions` with valid `url` fields.
-     * After calling this, `volumes` and `imageOptionsMap` will be populated.
      */
     fetchLinkedData(): Promise<void>;
     /**
@@ -922,43 +1388,23 @@ declare class NVDocument {
      */
     getImageOptions(image: NVImage): ImageFromUrlOptions | null;
     /**
-     * Serialise the document.
-     *
-     * @param embedImages  If false, encodedImageBlobs is left empty
-     *                     (imageOptionsArray still records the URL / name).
-     * @param embedDrawing  If false, encodedDrawingBlob is left empty
+     * Serialise the document by delegating to NVSerializer.
      */
     json(embedImages?: boolean, embedDrawing?: boolean): ExportDocumentData;
     download(fileName: string, compress: boolean, opts?: {
         embedImages: boolean;
     }): Promise<void>;
     /**
-     * Deserialize mesh data objects
-     */
-    static deserializeMeshDataObjects(document: NVDocument): void;
-    /**
      * Factory method to return an instance of NVDocument from a URL
      */
     static loadFromUrl(url: string): Promise<NVDocument>;
-    /**
-     * Factory method to return an instance of NVDocument from a File object
-     */
     static loadFromFile(file: Blob): Promise<NVDocument>;
     /**
      * Factory method to return an instance of NVDocument from JSON.
-     *
-     * This will merge any saved configuration options (`opts`) with the DEFAULT_OPTIONS,
-     * ensuring any missing values are filled with defaults. It also restores special-case
-     * fields like `meshThicknessOn2D` when serialized as the string "infinity".
-     *
-     * @param data - A serialized DocumentData object
-     * @returns A reconstructed NVDocument instance
+     * Delegates the main parsing to NVSerializer, then applies NVDocument-specific
+     * post-processing (opts decode, scene defaults, clone measurements/angles).
      */
-    static loadFromJSON(data: DocumentData): NVDocument;
-    /**
-     * Factory method to return an instance of NVDocument from JSON
-     */
-    static oldloadFromJSON(data: DocumentData): NVDocument;
+    static loadFromJSON(data: DocumentData): Promise<NVDocument>;
     /**
      * Sets the callback function to be called when opts properties change
      */
@@ -1655,6 +2101,182 @@ declare function handleDragEnter(e: MouseEvent): void;
  */
 declare function handleDragOver(e: MouseEvent): void;
 
+/**
+ * Type-safe event map for all Niivue events.
+ * Maps event names to their detail types.
+ *
+ * @example
+ * ```typescript
+ * // Type-safe event listening
+ * niivue.addEventListener('locationChange', (event) => {
+ *   // event.detail is typed based on the event name
+ *   console.log('Location changed:', event.detail)
+ * })
+ * ```
+ */
+interface NiivueEventMap {
+    /** Fired when a drag operation is released */
+    dragRelease: DragReleaseParams;
+    /** Fired when mouse button is released */
+    mouseUp: Partial<UIData>;
+    /** Fired when the crosshair location changes */
+    locationChange: unknown;
+    /** Fired when intensity values change at the crosshair location */
+    intensityChange: NVImage;
+    /** Fired when a click-to-segment operation completes */
+    clickToSegment: {
+        mm3: number;
+        mL: number;
+    };
+    /** Fired when a distance measurement is completed */
+    measurementCompleted: CompletedMeasurement;
+    /** Fired when an angle measurement is completed */
+    angleCompleted: CompletedAngle;
+    /** Fired when an image/volume is loaded */
+    imageLoaded: NVImage;
+    /** Fired when a mesh is loaded */
+    meshLoaded: NVMesh;
+    /** Fired when a volume is added from a URL */
+    volumeAddedFromUrl: {
+        imageOptions: ImageFromUrlOptions;
+        volume: NVImage;
+    };
+    /** Fired when a volume loaded from a URL is removed */
+    volumeWithUrlRemoved: {
+        url: string;
+    };
+    /** Fired when any volume is removed from the scene */
+    volumeRemoved: {
+        volume: NVImage;
+        index: number;
+    };
+    /** Fired when a volume is updated */
+    volumeUpdated: undefined;
+    /** Fired when a mesh is added from a URL */
+    meshAddedFromUrl: {
+        meshOptions: LoadFromUrlParams;
+        mesh: NVMesh;
+    };
+    /** Fired when a mesh loaded from a URL is removed */
+    meshWithUrlRemoved: {
+        url: string;
+    };
+    /** Fired when any mesh is removed from the scene */
+    meshRemoved: {
+        mesh: NVMesh;
+    };
+    /** Fired when a document is loaded */
+    documentLoaded: NVDocument;
+    /** Fired when DICOM loader finishes processing images */
+    dicomLoaderFinished: {
+        files: Array<NVImage | NVMesh>;
+    };
+    /** Fired when the frame changes in a 4D volume */
+    frameChange: {
+        volume: NVImage;
+        index: number;
+    };
+    /** Fired when azimuth or elevation angles change in 3D view */
+    azimuthElevationChange: {
+        azimuth: number;
+        elevation: number;
+    };
+    /** Fired when clip plane changes */
+    clipPlaneChange: {
+        clipPlane: number[];
+    };
+    /** Fired when the slice type (view layout) changes */
+    sliceTypeChange: {
+        sliceType: SLICE_TYPE;
+    };
+    /** Fired when 3D zoom level changes */
+    zoom3DChange: {
+        zoom: number;
+    };
+    /** Fired when a custom mesh shader is added */
+    customMeshShaderAdded: {
+        fragmentShaderText: string;
+        name: string;
+    };
+    /** Fired when a mesh's shader is changed */
+    meshShaderChanged: {
+        meshIndex: number;
+        shaderIndex: number;
+    };
+    /** Fired when a mesh property is changed */
+    meshPropertyChanged: {
+        meshIndex: number;
+        key: string;
+        value: unknown;
+    };
+    /** Fired when volume stacking order changes */
+    volumeOrderChanged: {
+        volumes: NVImage[];
+    };
+    /** Fired when the drawing pen value changes */
+    penValueChanged: {
+        penValue: number;
+        isFilledPen: boolean;
+    };
+    /** Fired when the active drawing tool changes (high-level interpretation of pen value and drawing state) */
+    drawingToolChanged: {
+        tool: 'off' | 'draw' | 'erase' | 'eraseCluster' | 'growCluster' | 'growClusterBright' | 'growClusterDark' | 'clickToSegment';
+        penValue: number;
+        isFilledPen: boolean;
+    };
+    /** Fired when the drawing bitmap materially changes (commit, undo, load, close) */
+    drawingChanged: {
+        action: 'draw' | 'undo' | 'load' | 'close';
+    };
+    /** Fired when drawing mode is toggled on or off */
+    drawingEnabled: {
+        enabled: boolean;
+    };
+    /** Fired when visualization options change */
+    optsChange: {
+        propertyName: keyof NVConfigOptions;
+        newValue: NVConfigOptions[keyof NVConfigOptions];
+        oldValue: NVConfigOptions[keyof NVConfigOptions];
+    };
+    /** Fired on error messages */
+    error: {
+        message?: string;
+    };
+    /** Fired on info messages */
+    info: {
+        message?: string;
+    };
+    /** Fired on warning messages */
+    warn: {
+        message?: string;
+    };
+    /** Fired on debug messages */
+    debug: {
+        message?: string;
+    };
+}
+/**
+ * Type-safe event class for Niivue events.
+ * Extends CustomEvent with typed detail property.
+ */
+declare class NiivueEvent<K extends keyof NiivueEventMap> extends CustomEvent<NiivueEventMap[K]> {
+    constructor(type: K, detail: NiivueEventMap[K]);
+}
+/**
+ * Type-safe event listener for Niivue events.
+ * Listeners can be synchronous or asynchronous.
+ */
+type NiivueEventListener<K extends keyof NiivueEventMap> = (event: NiivueEvent<K>) => void | Promise<void>;
+/**
+ * Options for addEventListener/removeEventListener.
+ * Supports all standard EventTarget options including:
+ * - capture: boolean - Use capture phase
+ * - once: boolean - Remove listener after first invocation
+ * - passive: boolean - Listener will never call preventDefault()
+ * - signal: AbortSignal - Remove listener when signal is aborted
+ */
+type NiivueEventListenerOptions = boolean | AddEventListenerOptions;
+
 declare class Shader {
     program: WebGLProgram;
     uniforms: Record<string, WebGLUniformLocation | null>;
@@ -1728,17 +2350,12 @@ declare class NVMeshLoaders {
     static readTT(buffer: ArrayBuffer): Promise<TT>;
     /**
      * Assemble dpg from a map-of-groups into a ValuesArray ordered by groups[].
+     * Missing group data or tags are padded with NaN to maintain group alignment.
      *
      * @param dpgMap - map from groupId -> ValuesArray (entries for that group)
-     * @param groups - ValuesArray describing groups; groups[i].id defines the ordering
-     * @returns ValuesArray - one entry per tag where vals is the concatenation of each group's vals in groups[] order
-     *
-     * @throws Error when:
-     *  - groups is empty or missing
-     *  - any group in groups is missing from dpgMap
-     *  - any group contains duplicate entries for a tag
-     *  - tag coverage differs between groups (missing tag in any group)
-     *  - any entry has invalid/unconvertible vals
+     * @param groups - ValuesArray describing groups; defines the result ordering
+     * @returns ValuesArray - one entry per unique tag found across all groups
+     * @throws Error if "groups" is empty or missing
      */
     static assembleDpgFromMap(dpgMap: Record<string, ValuesArray>, groups: ValuesArray): ValuesArray;
     static readTRX(buffer: ArrayBuffer): Promise<TRX>;
@@ -1808,7 +2425,7 @@ type DicomLoader = DicomLoader$1;
  * @example
  * let niivue = new Niivue({crosshairColor: [0,1,0,0.5], textHeight: 0.5}) // a see-through green crosshair, and larger text labels
  */
-declare class Niivue {
+declare class Niivue extends EventTarget {
     #private;
     loaders: LoaderRegistry;
     dicomLoader: DicomLoader$1 | null;
@@ -1903,6 +2520,7 @@ declare class Niivue {
     private canvasObserver;
     syncOpts: SyncOpts;
     readyForSync: boolean;
+    private _skipDragInDraw;
     uiData: UIData;
     back: NVImage | null;
     overlays: NVImage[];
@@ -2099,6 +2717,13 @@ declare class Niivue {
     onMeshAddedFromUrl: (meshOptions: LoadFromUrlParams, mesh: NVMesh) => void;
     onMeshAdded: () => void;
     onMeshWithUrlRemoved: (url: string) => void;
+    /**
+     * callback function to run when the 3D zoom level changes
+     * @example
+     * niivue.onZoom3DChange = (zoom) => {
+     *   console.log('3D zoom scale: ', zoom)
+     * }
+     */
     onZoom3DChange: (zoom: number) => void;
     /**
      * callback function to run when the user changes the rotation of the 3D rendering
@@ -2136,6 +2761,26 @@ declare class Niivue {
      * @param oldValue - The previous value of the option.
      */
     onOptsChange: (propertyName: keyof NVConfigOptions, newValue: NVConfigOptions[keyof NVConfigOptions], oldValue: NVConfigOptions[keyof NVConfigOptions]) => void;
+    /** Callback when a distance measurement is completed */
+    onMeasurementCompleted: (measurement: CompletedMeasurement) => void;
+    /** Callback when an angle measurement is completed */
+    onAngleCompleted: (angle: CompletedAngle) => void;
+    /** Callback when the drawing pen value changes */
+    onPenValueChanged: (penValue: number, isFilledPen: boolean) => void;
+    /** Callback when the active drawing tool changes */
+    onDrawingToolChanged: (tool: string, penValue: number, isFilledPen: boolean) => void;
+    /** Callback when any volume is removed from the scene */
+    onVolumeRemoved: (volume: NVImage, index: number) => void;
+    /** Callback when any mesh is removed from the scene */
+    onMeshRemoved: (mesh: NVMesh) => void;
+    /** Callback when the slice type (view layout) changes */
+    onSliceTypeChange: (sliceType: SLICE_TYPE) => void;
+    /** Callback when the drawing bitmap materially changes */
+    onDrawingChanged: (action: string) => void;
+    /** Callback when drawing mode is toggled on or off */
+    onDrawingEnabled: (enabled: boolean) => void;
+    /** Callback when volume stacking order changes */
+    onVolumeOrderChanged: (volumes: NVImage[]) => void;
     document: NVDocument;
     /** Get the current scene configuration. */
     get scene(): Scene;
@@ -2163,6 +2808,41 @@ declare class Niivue {
      * @param options  - options object to set modifiable Niivue properties
      */
     constructor(options?: Partial<NVConfigOptions>);
+    /**
+     * Type-safe addEventListener for Niivue events.
+     * Supports all standard EventTarget options including once, capture, passive, and signal with AbortController.
+     * @param type - Event name
+     * @param listener - Event listener function
+     * @param options - Event listener options (capture, once, passive, signal)
+     * @example
+     * ```typescript
+     * niivue.addEventListener('locationChange', (event) => {
+     *   console.log('Location changed:', event.detail)
+     * })
+     *
+     * // With once option
+     * niivue.addEventListener('imageLoaded', handler, { once: true })
+     *
+     * // With AbortController
+     * const controller = new AbortController()
+     * niivue.addEventListener('locationChange', handler, { signal: controller.signal })
+     * controller.abort() // removes the listener
+     * ```
+     */
+    addEventListener<K extends keyof NiivueEventMap>(type: K, listener: NiivueEventListener<K>, options?: NiivueEventListenerOptions): void;
+    /**
+     * Type-safe removeEventListener for Niivue events.
+     * @param type - Event name
+     * @param listener - Event listener function to remove
+     * @param options - Event listener options
+     */
+    removeEventListener<K extends keyof NiivueEventMap>(type: K, listener: NiivueEventListener<K>, options?: NiivueEventListenerOptions): void;
+    /**
+     * Internal helper to emit events alongside legacy callbacks.
+     * Events fire BEFORE callbacks.
+     * @private
+     */
+    private _emitEvent;
     /**
      * Clean up event listeners and observers
      * Call this when the Niivue instance is no longer needed.
@@ -3126,6 +3806,11 @@ declare class Niivue {
      */
     setPenValue(penValue: number, isFilledPen?: boolean): void;
     /**
+     * Derives the high-level drawing tool name from a pen value and the current drawing state.
+     * @internal
+     */
+    private _deriveDrawingTool;
+    /**
      * control whether drawing is transparent (0), opaque (1) or translucent (between 0 and 1).
      * @param opacity - translucency of drawing
      * @example niivue.setDrawOpacity(0.7)
@@ -3175,6 +3860,47 @@ declare class Niivue {
      * @see {@link https://niivue.com/demos/features/atlas.html | live demo usage}
      */
     setOpacity(volIdx: number, newOpacity: number): void;
+    /**
+     * Get the current affine matrix of a volume.
+     * @param volIdx - index of volume (0 = base image, 1+ = overlays)
+     * @returns A deep copy of the 4x4 affine matrix as a 2D array (row-major)
+     * @example
+     * const affine = niivue.getVolumeAffine(1) // get affine of first overlay
+     */
+    getVolumeAffine(volIdx: number): number[][];
+    /**
+     * Set the affine matrix of a volume and update the scene.
+     * @param volIdx - index of volume to modify (0 = base image, 1+ = overlays)
+     * @param affine - new 4x4 affine matrix as a 2D array (row-major)
+     * @example
+     * // Shift volume 10mm in X direction
+     * const affine = niivue.getVolumeAffine(1)
+     * affine[0][3] += 10
+     * niivue.setVolumeAffine(1, affine)
+     */
+    setVolumeAffine(volIdx: number, affine: number[][]): void;
+    /**
+     * Apply a transform (translation, rotation, scale) to a volume's affine and update the scene.
+     * Useful for manual image registration between volumes.
+     * @param volIdx - index of volume to modify (0 = base image, 1+ = overlays)
+     * @param transform - transform to apply with translation (mm), rotation (degrees), and scale
+     * @example
+     * // Rotate overlay 15 degrees around Y axis and translate 5mm in X
+     * niivue.applyVolumeTransform(1, {
+     *   translation: [5, 0, 0],
+     *   rotation: [0, 15, 0],
+     *   scale: [1, 1, 1]
+     * })
+     * @see {@link https://niivue.com/demos/features/manual.registration.html | live demo usage}
+     */
+    applyVolumeTransform(volIdx: number, transform: AffineTransform): void;
+    /**
+     * Reset a volume's affine matrix to its original state when first loaded.
+     * @param volIdx - index of volume to reset (0 = base image, 1+ = overlays)
+     * @example
+     * niivue.resetVolumeAffine(1) // reset overlay to original position
+     */
+    resetVolumeAffine(volIdx: number): void;
     /**
      * set the scale of the 3D rendering. Larger numbers effectively zoom.
      * @param scale - the new scale value
@@ -3258,15 +3984,15 @@ declare class Niivue {
      */
     loadDocument(document: NVDocument): Promise<this>;
     /**
- * generates JavaScript to load the current scene as a document
- * @param canvasId - id of canvas NiiVue will be attached to
- * @param esm - bundled version of NiiVue
- * @example
- * const javascript = this.generateLoadDocumentJavaScript("gl1");
- * const html = `<html><body><canvas id="gl1"></canvas><script type="module" async>
-        ${javascript}</script></body></html>`;
- * @see {@link https://niivue.com/demos/features/save.custom.html.html | live demo usage}
- */
+* generates JavaScript to load the current scene as a document
+* @param canvasId - id of canvas NiiVue will be attached to
+* @param esm - bundled version of NiiVue
+* @example
+* const javascript = this.generateLoadDocumentJavaScript("gl1");
+* const html = `<html><body><canvas id="gl1"></canvas><script type="module" async>
+      ${javascript}</script></body></html>`;
+* @see {@link https://niivue.com/demos/features/save.custom.html.html | live demo usage}
+*/
     generateLoadDocumentJavaScript(canvasId: string, esm: string): Promise<string>;
     /**
      * generates HTML of current scene
@@ -3808,9 +4534,12 @@ declare class Niivue {
      * @param isLinear - reslice with linear rather than nearest-neighbor interpolation (default true).
      * @param asFloat32 - use Float32 datatype rather than Uint8 (default false).
      * @param isRobustMinMax - clamp intensity with robust min max (~2%..98%) instead of FreeSurfer (0%..99.99%) (default false).
+     * @param targetShape - output dimensions [x, y, z] (default [256, 256, 256]).
+     * @param targetVoxelSize - output voxel size in mm (default 1.0).
+     * @param rawFloat32 - return raw resampled Float32 data without intensity rescaling (default false). Useful for ML inference where original intensity values must be preserved.
      * @see {@link https://niivue.com/demos/features/torso.html | live demo usage}
      */
-    conform(volume: NVImage, toRAS?: boolean, isLinear?: boolean, asFloat32?: boolean, isRobustMinMax?: boolean): Promise<NVImage>;
+    conform(volume: NVImage, toRAS?: boolean, isLinear?: boolean, asFloat32?: boolean, isRobustMinMax?: boolean, targetShape?: [number, number, number], targetVoxelSize?: number, rawFloat32?: boolean): Promise<NVImage>;
     /**
      * darken crevices and brighten corners when 3D rendering drawings.
      * @param ao - amount of ambient occlusion (default 0.4)
@@ -3952,7 +4681,7 @@ declare class Niivue {
      * Supports thumbnail loading, graph interaction, 3D slice scrolling, and click-to-segment with flood fill.
      * @internal
      */
-    mouseClick(x: number, y: number, posChange?: number, isDelta?: boolean): void;
+    mouseClick(x: number, y: number, posChange?: number, isDelta?: boolean): boolean;
     /**
      * Draws a 10cm ruler on a 2D slice tile based on screen FOV and slice dimensions.
      * @internal
@@ -4111,6 +4840,8 @@ declare class Niivue {
      * @internal
      */
     drawRect(leftTopWidthHeight: number[], lineColor?: number[]): void;
+    getZarrVolume(): NVImage | null;
+    getZarrVolumes(): NVImage[];
     private drawBoundsBox;
     /**
      * Draw a circle or outline at given position with specified color or default crosshair color.
@@ -4681,4 +5412,4 @@ declare class Niivue {
     }): void;
 }
 
-export { COLORMAP_TYPE, type ColormapListEntry, type CompletedAngle, type CompletedMeasurement, type Connectome, type ConnectomeOptions, type CustomLoader, DEFAULT_OPTIONS, DRAG_MODE, type Descriptive, type DicomLoader, type DicomLoaderInput, type DocumentData, type DragReleaseParams, type ExportDocumentData, type FontMetrics, type GetFileExtOptions, type Graph, INITIAL_SCENE_DATA, LabelAnchorPoint, LabelLineTerminator, LabelTextAlignment, type LegacyConnectome, type LegacyNodes, type LoaderRegistry, MESH_EXTENSIONS, type MM, MULTIPLANAR_TYPE, type MeshLoaderResult, type MouseEventConfig, type MvpMatrix2D, type NVConfigOptions, type NVConnectomeEdge, type NVConnectomeNode, NVDocument, NVImage, NVImageFromUrlOptions, NVLabel3D, NVLabel3DStyle, NVMesh, NVMeshFromUrlOptions, NVMeshLayerDefaults, NVMeshLoaders, NVMeshUtilities, NVUtilities, type NiftiHeader, type NiiVueLocation, type NiiVueLocationValue, Niivue, PEN_TYPE, type Point, type RegisterLoaderParams, SHOW_RENDER, SLICE_TYPE, type SaveImageOptions, type Scene, type SliceScale, type SyncOpts, type TouchEventConfig, type UIData, type Volume, cmapper, ColorTables as colortables, getFileExt, getLoader, getMediaByUrl, handleDragEnter, handleDragOver, isDicomExtension, isMeshExt, readDirectory, readFileAsDataURL, registerLoader, traverseFileTree };
+export { type AffineTransform, type ChunkCoord, type ColormapListEntry, type CompletedAngle, type CompletedMeasurement, type Connectome, type ConnectomeOptions, type CustomLoader, DEFAULT_OPTIONS, DEFAULT_SCENE_DATA, DRAG_MODE, type Descriptive, type DicomLoader, type DicomLoaderInput, type DocumentData, type DragReleaseParams, type ExportDocumentData, type FontMetrics, type GetFileExtOptions, type Graph, INITIAL_SCENE_DATA, LabelAnchorPoint, LabelLineTerminator, LabelTextAlignment, type LegacyConnectome, type LegacyNodes, type LoaderRegistry, MESH_EXTENSIONS, type MM, MULTIPLANAR_TYPE, type MeshLoaderResult, type MouseEventConfig, type MvpMatrix2D, type NVConfigOptions, type NVConnectomeEdge, type NVConnectomeNode, NVDocument, NVImage, NVImageFromUrlOptions, NVLabel3D, NVLabel3DStyle, NVMesh, NVMeshFromUrlOptions, NVMeshLayerDefaults, NVMeshLoaders, NVMeshUtilities, NVUtilities, NVZarrHelper, type NVZarrHelperOptions, type NiftiHeader, type NiiVueLocation, type NiiVueLocationValue, Niivue, NiivueEvent, type NiivueEventListener, type NiivueEventListenerOptions, type NiivueEventMap, PEN_TYPE, type Point, type RegisterLoaderParams, SHOW_RENDER, SLICE_TYPE, type SaveImageOptions, type Scene, type SliceScale, type SyncOpts, type TouchEventConfig, type UIData, type Volume, ZarrChunkCache, ZarrChunkClient, type ZarrPyramidInfo, type ZarrPyramidLevel, arrayToMat4, cmapper, ColorTables as colortables, copyAffine, createTransformMatrix, degToRad, eulerToRotationMatrix, getFileExt, getLoader, getMediaByUrl, handleDragEnter, handleDragOver, identityTransform, isDicomExtension, isMeshExt, mat4ToArray, multiplyAffine, readDirectory, readFileAsDataURL, registerLoader, transformsEqual, traverseFileTree };
