@@ -5249,7 +5249,7 @@ var forEach3 = (function() {
 // package.json
 var package_default = {
   name: "@niivue/niivue",
-  version: "0.68.1",
+  version: "0.68.2",
   description: "minimal webgl2 nifti image viewer",
   types: "./build/niivue/index.d.ts",
   main: "./build/niivue/index.js",
@@ -16357,8 +16357,8 @@ var NVMeshLoaders = class _NVMeshLoaders {
     }
     const vers = reader.getUint32(992, true);
     const hdr_sz = reader.getUint32(996, true);
-    if (vers > 2 || hdr_sz !== 1e3 || magic !== 1128354388) {
-      throw new Error("Not a valid TRK file");
+    if (vers > 3 || hdr_sz !== 1e3 || magic !== 1128354388) {
+      throw new Error(`Not a valid TRK file expected version \u22643 (${vers}), header size 1000 (${hdr_sz}) and magic of 1128354388 (${magic})`);
     }
     const n_scalars = reader.getInt16(36, true);
     const dpv = [];
@@ -23036,7 +23036,7 @@ function requestCORSIfNotSameOrigin(img, url) {
     img.crossOrigin = "";
   }
 }
-async function loadPngAsTexture(gl, pngUrl, textureNum, fontShader, bmpShader, fontTexture, bmpTexture, matCapTexture, onBmpTextureLoaded, onDrawScene) {
+async function loadPngAsTexture(gl, pngUrl, textureNum, fontShader, bmpShader, fontTexture, bmpTexture, matCapTexture, onBmpTextureLoaded) {
   return new Promise((resolve2, reject) => {
     const img = new Image();
     img.onload = () => {
@@ -23082,9 +23082,6 @@ async function loadPngAsTexture(gl, pngUrl, textureNum, fontShader, bmpShader, f
       gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
       resolve2(pngTexture);
-      if (textureNum !== 4 && onDrawScene) {
-        onDrawScene();
-      }
     };
     img.onerror = reject;
     requestCORSIfNotSameOrigin(img, pngUrl);
@@ -28636,9 +28633,9 @@ function getImageOptions(nvImage) {
     // colormap
     nvImage.opacity,
     // opacity
-    nvImage.hdr.cal_min,
+    nvImage.cal_min,
     // cal_min
-    nvImage.hdr.cal_max,
+    nvImage.cal_max,
     // cal_max
     nvImage.trustCalMinMax,
     // trustCalMinMax,
@@ -28653,7 +28650,12 @@ function getImageOptions(nvImage) {
     nvImage.frame4D,
     nvImage.imageType,
     // imageType
-    nvImage.colormapType
+    nvImage.cal_minNeg,
+    // cal_minNeg
+    nvImage.cal_maxNeg,
+    // cal_maxNeg
+    nvImage.colorbarVisible
+    // colorbarVisible
   );
   return options;
 }
@@ -32284,9 +32286,31 @@ var NVImage = class _NVImage {
   computeObliqueAngle(mtx44) {
     return computeObliqueAngle(mtx44);
   }
+  /**
+   * Convert vector field from Float32 to RGBA representation.
+   * Note: We use RGBA rather than RGB and use least significant bits to store vector polarity.
+   * This allows a single bitmap to store BOTH (unsigned) color magnitude and signed vector direction.
+   *
+   * @param nvImage - The NVImage instance
+   * @param inImg - Input Float32Array containing vector field data
+   * @returns Uint8Array with RGBA encoded vector data
+   */
   float32V1asRGBA(inImg) {
     return float32V1asRGBA(this, inImg);
   }
+  /**
+   * Load and process diffusion tensor vector (V1) data with optional flips.
+   * The vectors must be of unit length.
+   * Modifies the nvImage.img property with the processed RGBA data.
+   *
+   * @param nvImage - The NVImage instance
+   * @param isFlipX - Flip X component (default: false)
+   * @param isFlipY - Flip Y component (default: false)
+   * @param isFlipZ - Flip Z component (default: false)
+   * @example nv1.loadVolumes(volumeList); nv1.volumes[1].loadImgV1();
+   * @returns true if successful, false if V1 data is not available
+   * @see {@link https://niivue.com/demos/features/modulate.html | live demo usage}
+   */
   loadImgV1(isFlipX = false, isFlipY = false, isFlipZ = false) {
     return loadImgV1(this, isFlipX, isFlipY, isFlipZ);
   }
@@ -33461,13 +33485,13 @@ function migrateLegacyDocument(input) {
           }
         }
       }
-      if (copy6.colormap && !Array.isArray(copy6.colormap)) {
+      if (copy6.colormap && typeof copy6.colormap !== "string" && !Array.isArray(copy6.colormap)) {
         const arr = extractNumberArray(copy6.colormap);
         if (arr) {
           copy6.colormap = arr;
         }
       }
-      if (copy6.colormapNegative && !Array.isArray(copy6.colormapNegative)) {
+      if (copy6.colormapNegative && typeof copy6.colormapNegative !== "string" && !Array.isArray(copy6.colormapNegative)) {
         const arr = extractNumberArray(copy6.colormapNegative);
         if (arr) {
           copy6.colormapNegative = arr;
@@ -33715,7 +33739,9 @@ var NVSerializer = class _NVSerializer {
             urlImageData: v?.urlImgData ?? "",
             cal_minNeg: v?.cal_minNeg ?? NaN,
             cal_maxNeg: v?.cal_maxNeg ?? NaN,
-            colorbarVisible: v?.colorbarVisible ?? true
+            colorbarVisible: v?.colorbarVisible ?? true,
+            colormapNegative: v?.colormapNegative ?? "",
+            colormapType: v?.colormapType ?? 0
           };
         } else {
           if (!("imageType" in imageOptions)) {
@@ -33727,6 +33753,11 @@ var NVSerializer = class _NVSerializer {
         imageOptions.opacity = v.opacity;
         imageOptions.cal_max = v.cal_max ?? NaN;
         imageOptions.cal_min = v.cal_min ?? NaN;
+        imageOptions.colormapNegative = v.colormapNegative ?? "";
+        imageOptions.cal_minNeg = v.cal_minNeg ?? NaN;
+        imageOptions.cal_maxNeg = v.cal_maxNeg ?? NaN;
+        imageOptions.colorbarVisible = v.colorbarVisible ?? true;
+        imageOptions.colormapType = v.colormapType ?? 0;
         imageOptionsArray.push(imageOptions);
         if (embedImages) {
           const blob = NVUtilities.uint8tob64(v.toUint8Array());
@@ -35794,7 +35825,9 @@ var fragRenderGradientShader = kFragRenderGradientDecl + kRenderFunc + kRenderIn
 		vec4 colorSample = texture(volume, samplePos.xyz);
 		if (colorSample.a >= 0.0) {
 			vec4 grad = texture(gradient, samplePos.xyz);
-			grad.rgb = normalize(grad.rgb*2.0 - 1.0);
+			grad.rgb = grad.rgb*2.0 - 1.0;
+			if (grad.a > 0.0)
+				grad.rgb = normalize(grad.rgb);
 			//if (grad.a < prevGrad.a)
 			//	grad.rgb = prevGrad.rgb;
 			//prevGrad = grad;
@@ -35835,7 +35868,10 @@ var fragRenderGradientValuesShader = kFragRenderGradientDecl + kRenderFunc + kRe
 		vec4 colorSample = texture(volume, samplePos.xyz);
 		if (colorSample.a >= 0.0) {
 			vec4 grad = texture(gradient, samplePos.xyz);
-			colorSample.rgb = abs(normalize(grad.rgb*2.0 - 1.0));
+			grad.rgb = grad.rgb*2.0 - 1.0;
+			if (grad.a > 0.0)
+				grad.rgb = normalize(grad.rgb);
+			colorSample.rgb = abs(grad.rgb);
 			if (firstHit.a > len)
 				firstHit = samplePos;
 			backNearest = min(backNearest, samplePos.a);
@@ -37371,7 +37407,7 @@ void main(void) {
  samp += texture(intensityVol,vx+vec3(-dX,-dY,-dZ));
  FragColor = samp*0.125;
 }`;
-var sobelBlurFragShader = `#version 300 es
+var gradientPrePassFragShader = `#version 300 es
 #line 298
 precision highp int;
 precision highp float;
@@ -37383,44 +37419,48 @@ uniform float dY;
 uniform float dZ;
 uniform highp sampler3D intensityVol;
 void main(void) {
- vec3 vx = vec3(TexCoord.xy, coordZ);
- vec4 XYZ = texture(intensityVol,vx+vec3(+dX,+dY,+dZ));
- vec4 OYZ = texture(intensityVol,vx+vec3(0.0,+dY,+dZ));
- vec4 xYZ = texture(intensityVol,vx+vec3(-dX,+dY,+dZ));
- vec4 XOZ = texture(intensityVol,vx+vec3(+dX,0.0,+dZ));
- vec4 OOZ = texture(intensityVol,vx+vec3(0.0,0.0,+dZ));
- vec4 xOZ = texture(intensityVol,vx+vec3(-dX,0.0,+dZ));
- vec4 XyZ = texture(intensityVol,vx+vec3(+dX,-dY,+dZ));
- vec4 OyZ = texture(intensityVol,vx+vec3(0.0,-dY,+dZ));
- vec4 xyZ = texture(intensityVol,vx+vec3(-dX,-dY,+dZ));
-
- vec4 XYO = texture(intensityVol,vx+vec3(+dX,+dY,0.0));
- vec4 OYO = texture(intensityVol,vx+vec3(0.0,+dY,0.0));
- vec4 xYO = texture(intensityVol,vx+vec3(-dX,+dY,0.0));
- vec4 XOO = texture(intensityVol,vx+vec3(+dX,0.0,0.0));
- vec4 OOO = texture(intensityVol,vx+vec3(0.0,0.0,0.0));
- vec4 xOO = texture(intensityVol,vx+vec3(-dX,0.0,0.0));
- vec4 XyO = texture(intensityVol,vx+vec3(+dX,-dY,0.0));
- vec4 OyO = texture(intensityVol,vx+vec3(0.0,-dY,0.0));
- vec4 xyO = texture(intensityVol,vx+vec3(-dX,-dY,0.0));
-
- vec4 XYz = texture(intensityVol,vx+vec3(+dX,+dY,-dZ));
- vec4 OYz = texture(intensityVol,vx+vec3(0.0,+dY,-dZ));
- vec4 xYz = texture(intensityVol,vx+vec3(-dX,+dY,-dZ));
- vec4 XOz = texture(intensityVol,vx+vec3(+dX,0.0,-dZ));
- vec4 OOz = texture(intensityVol,vx+vec3(0.0,0.0,-dZ));
- vec4 xOz = texture(intensityVol,vx+vec3(-dX,0.0,-dZ));
- vec4 Xyz = texture(intensityVol,vx+vec3(+dX,-dY,-dZ));
- vec4 Oyz = texture(intensityVol,vx+vec3(0.0,-dY,-dZ));
- vec4 xyz = texture(intensityVol,vx+vec3(-dX,-dY,-dZ));
-
- vec4 blurred = vec4 (0.0, 0.0, 0.0, 0.0);
- blurred.r = 2.0*(xOz.r +xOZ.r +xyO.r +xYO.r +xOO.r +XOz.r +XOZ.r +XyO.r +XYO.r +XOO.r) +xyz.r +xyZ.r +xYz.r +xYZ.r +Xyz.r +XyZ.r +XYz.r +XYZ.r;
- blurred.g = 2.0*(Oyz.r +OyZ.r +xyO.r +XyO.r +OyO.r +OYz.r +OYZ.r +xYO.r +XYO.r +OYO.r) +xyz.r +Xyz.r +xyZ.r +XyZ.r +xYz.r +XYz.r +xYZ.r +XYZ.r;
- blurred.b = 2.0*(Oyz.r +OYz.r +xOz.r +XOz.r +OOz.r +OyZ.r +OYZ.r +xOZ.r +XOZ.r +OOZ.r) +xyz.r +Xyz.r +xYz.r +XYz.r +xyZ.r +XyZ.r +XyZ.r +XYZ.r;
- blurred.a = 0.32*(abs(blurred.r)+abs(blurred.g)+abs(blurred.b));
- // 0.0357 = 1/28 to account for weights, rescale to 2**16,
- FragColor = 0.0357*blurred;
+  vec3 vx = vec3(TexCoord.xy, coordZ);
+  // --- Z+ Plane (+dZ) ---
+  float XYZ = texture(intensityVol, vx + vec3(+dX, +dY, +dZ)).a;
+  float OYZ = texture(intensityVol, vx + vec3(0.0, +dY, +dZ)).a;
+  float xYZ = texture(intensityVol, vx + vec3(-dX, +dY, +dZ)).a;
+  float XOZ = texture(intensityVol, vx + vec3(+dX, 0.0, +dZ)).a;
+  float OOZ = texture(intensityVol, vx + vec3(0.0, 0.0, +dZ)).a;
+  float xOZ = texture(intensityVol, vx + vec3(-dX, 0.0, +dZ)).a;
+  float XyZ = texture(intensityVol, vx + vec3(+dX, -dY, +dZ)).a;
+  float OyZ = texture(intensityVol, vx + vec3(0.0, -dY, +dZ)).a;
+  float xyZ = texture(intensityVol, vx + vec3(-dX, -dY, +dZ)).a;
+  // --- Z0 Plane (0.0) ---
+  float XYO = texture(intensityVol, vx + vec3(+dX, +dY, 0.0)).a;
+  float OYO = texture(intensityVol, vx + vec3(0.0, +dY, 0.0)).a;
+  float xYO = texture(intensityVol, vx + vec3(-dX, +dY, 0.0)).a;
+  float XOO = texture(intensityVol, vx + vec3(+dX, 0.0, 0.0)).a;
+  float OOO = texture(intensityVol, vx + vec3(0.0, 0.0, 0.0)).a;
+  float xOO = texture(intensityVol, vx + vec3(-dX, 0.0, 0.0)).a;
+  float XyO = texture(intensityVol, vx + vec3(+dX, -dY, 0.0)).a;
+  float OyO = texture(intensityVol, vx + vec3(0.0, -dY, 0.0)).a;
+  float xyO = texture(intensityVol, vx + vec3(-dX, -dY, 0.0)).a;
+  // --- Z- Plane (-dZ) ---
+  float XYz = texture(intensityVol, vx + vec3(+dX, +dY, -dZ)).a;
+  float OYz = texture(intensityVol, vx + vec3(0.0, +dY, -dZ)).a;
+  float xYz = texture(intensityVol, vx + vec3(-dX, +dY, -dZ)).a;
+  float XOz = texture(intensityVol, vx + vec3(+dX, 0.0, -dZ)).a;
+  float OOz = texture(intensityVol, vx + vec3(0.0, 0.0, -dZ)).a;
+  float xOz = texture(intensityVol, vx + vec3(-dX, 0.0, -dZ)).a;
+  float Xyz = texture(intensityVol, vx + vec3(+dX, -dY, -dZ)).a;
+  float Oyz = texture(intensityVol, vx + vec3(0.0, -dY, -dZ)).a;
+  float xyz = texture(intensityVol, vx + vec3(-dX, -dY, -dZ)).a;
+  // --- Directional blur sums ---
+  vec3 blurred;
+  blurred.x = 2.0 * (xOz + xOZ + xyO + xYO + xOO + XOz + XOZ + XyO + XYO + XOO)
+              + xyz + xyZ + xYz + xYZ + Xyz + XyZ + XYz + XYZ;
+  blurred.y = 2.0 * (Oyz + OyZ + xyO + XyO + OyO + OYz + OYZ + xYO + XYO + OYO)
+              + xyz + Xyz + xyZ + XyZ + xYz + XYz + xYZ + XYZ;
+  blurred.z = 2.0 * (Oyz + OYz + xOz + XOz + OOz + OyZ + OYZ + xOZ + XOZ + OOZ)
+              + xyz + Xyz + xYz + XYz + xyZ + XyZ + xYZ + XYZ;
+  float finalAlpha = 0.32 * (abs(blurred.x) + abs(blurred.y) + abs(blurred.z));
+  // 0.0357 = 1/28 to account for weights, rescale to 2**16,
+  FragColor = 0.0357 * vec4(blurred, finalAlpha);
 }`;
 var kGradientMagnitude = `
   gradientSample.a = log2(gradientSample.r*gradientSample.r + gradientSample.g*gradientSample.g + gradientSample.b*gradientSample.b + 1.922337562475971e-06) + 18.988706873717717;
@@ -37439,14 +37479,14 @@ uniform highp sampler3D intensityVol;
 void main(void) {
   vec3 vx = vec3(TexCoord.xy, coordZ);
   //Neighboring voxels 'T'op/'B'ottom, 'A'nterior/'P'osterior, 'R'ight/'L'eft
-  float TAR = texture(intensityVol,vx+vec3(+dX,+dY,+dZ)).r;
-  float TAL = texture(intensityVol,vx+vec3(+dX,+dY,-dZ)).r;
-  float TPR = texture(intensityVol,vx+vec3(+dX,-dY,+dZ)).r;
-  float TPL = texture(intensityVol,vx+vec3(+dX,-dY,-dZ)).r;
-  float BAR = texture(intensityVol,vx+vec3(-dX,+dY,+dZ)).r;
-  float BAL = texture(intensityVol,vx+vec3(-dX,+dY,-dZ)).r;
-  float BPR = texture(intensityVol,vx+vec3(-dX,-dY,+dZ)).r;
-  float BPL = texture(intensityVol,vx+vec3(-dX,-dY,-dZ)).r;
+  float TAR = texture(intensityVol,vx+vec3(+dX,+dY,+dZ)).a;
+  float TAL = texture(intensityVol,vx+vec3(+dX,+dY,-dZ)).a;
+  float TPR = texture(intensityVol,vx+vec3(+dX,-dY,+dZ)).a;
+  float TPL = texture(intensityVol,vx+vec3(+dX,-dY,-dZ)).a;
+  float BAR = texture(intensityVol,vx+vec3(-dX,+dY,+dZ)).a;
+  float BAL = texture(intensityVol,vx+vec3(-dX,+dY,-dZ)).a;
+  float BPR = texture(intensityVol,vx+vec3(-dX,-dY,+dZ)).a;
+  float BPL = texture(intensityVol,vx+vec3(-dX,-dY,-dZ)).a;
   vec4 gradientSample = vec4 (0.0, 0.0, 0.0, 0.0);
   gradientSample.r = BAR+BAL+BPR+BPL -TAR-TAL-TPR-TPL;
   gradientSample.g = TPR+TPL+BPR+BPL -TAR-TAL-BAR-BAL;
@@ -37454,7 +37494,8 @@ void main(void) {
 ${kGradientMagnitude}
 	// 0.04242020977371934 = 1/(log2(3*8) - log2(1/(255**2*8))) // 3*8 -> max for 1st order gradient
 	gradientSample.a *= 0.04242020977371934;
-  gradientSample.rgb = normalize(gradientSample.rgb);
+  float gradLen = length(gradientSample.rgb);
+  gradientSample.rgb = gradLen > 0.001 ? gradientSample.rgb / gradLen : vec3(0.0);
   gradientSample.rgb = (gradientSample.rgb * 0.5)+0.5;
   FragColor = gradientSample;
 }`;
@@ -37490,13 +37531,14 @@ void main(void) {
   vec4 P = texture(intensityVol,vx+vec3(0.0,-dY2,0.0));
   vec4 L = texture(intensityVol,vx+vec3(0.0,0.0,-dZ2));
   vec4 gradientSample = vec4 (0.0, 0.0, 0.0, 0.0);
-  gradientSample.r = -4.0*B.r +8.0*(BAR.r+BAL.r+BPR.r+BPL.r) -8.0*(TAR.r+TAL.r+TPR.r+TPL.r) +4.0*T.r;
-  gradientSample.g = -4.0*P.g +8.0*(TPR.g+TPL.g+BPR.g+BPL.g) -8.0*(TAR.g+TAL.g+BAR.g+BAL.g) +4.0*A.g;
-  gradientSample.b = -4.0*L.b +8.0*(TAL.b+TPL.b+BAL.b+BPL.b) -8.0*(TAR.b+TPR.b+BAR.b+BPR.b) +4.0*R.b;
+  gradientSample.x = -4.0*B.x +8.0*(BAR.x+BAL.x+BPR.x+BPL.x) -8.0*(TAR.x+TAL.x+TPR.x+TPL.x) +4.0*T.x;
+  gradientSample.y = -4.0*P.y +8.0*(TPR.y+TPL.y+BPR.y+BPL.y) -8.0*(TAR.y+TAL.y+BAR.y+BAL.y) +4.0*A.y;
+  gradientSample.z = -4.0*L.z +8.0*(TAL.z+TPL.z+BAL.z+BPL.z) -8.0*(TAR.z+TPR.z+BAR.z+BPR.z) +4.0*R.z;
 ${kGradientMagnitude}
 	gradientSample.a *= 0.0325;
-  gradientSample.rgb = normalize(gradientSample.rgb);
-  gradientSample.rgb =  (gradientSample.rgb * 0.5)+0.5;
+  float gradLen = length(gradientSample.xyz);
+  gradientSample.xyz = gradLen > 0.001 ? gradientSample.xyz / gradLen : vec3(0.0);
+  gradientSample.xyz =  (gradientSample.xyz * 0.5)+0.5;
   FragColor = gradientSample;
 }`;
 
@@ -37734,14 +37776,14 @@ function initColorbarShader(gl) {
 }
 function initImageProcessingShaders(gl) {
   const blurShader = new Shader(gl, blurVertShader, blurFragShader);
-  const sobelBlurShader = new Shader(gl, blurVertShader, sobelBlurFragShader);
+  const gradientPrePassShader = new Shader(gl, blurVertShader, gradientPrePassFragShader);
   const sobelFirstOrderShader = new Shader(gl, blurVertShader, sobelFirstOrderFragShader);
   const sobelSecondOrderShader = new Shader(gl, blurVertShader, sobelSecondOrderFragShader);
   const growCutShader = new Shader(gl, vertGrowCutShader, fragGrowCutShader);
   const passThroughShader = new Shader(gl, vertPassThroughShader, fragPassThroughShader);
   return {
     blurShader,
-    sobelBlurShader,
+    gradientPrePassShader,
     sobelFirstOrderShader,
     sobelSecondOrderShader,
     growCutShader,
@@ -39297,7 +39339,20 @@ function calculateRayDirection(params) {
   return worldRay;
 }
 function gradientGL(params) {
-  const { gl, hdr, genericVAO, unusedVAO, volumeTexture, paqdTexture, gradientOrder, blurShader: blurShaderInput, sobelBlurShader, sobelFirstOrderShader, sobelSecondOrderShader, rgbaTex: rgbaTex2 } = params;
+  const {
+    gl,
+    hdr,
+    genericVAO,
+    unusedVAO,
+    volumeTexture,
+    paqdTexture,
+    gradientOrder,
+    blurShader: blurShaderInput,
+    gradientPrePassShader,
+    sobelFirstOrderShader,
+    sobelSecondOrderShader,
+    rgbaTex: rgbaTex2
+  } = params;
   let { gradientTexture } = params;
   gl.bindVertexArray(genericVAO);
   const fb = gl.createFramebuffer();
@@ -39305,7 +39360,7 @@ function gradientGL(params) {
   gl.viewport(0, 0, hdr.dims[1], hdr.dims[2]);
   gl.disable(gl.BLEND);
   const tempTex3D = rgbaTex2(null, TEXTURE8_GRADIENT_TEMP, hdr.dims, true);
-  const blurShader = gradientOrder === 2 ? sobelBlurShader : blurShaderInput;
+  const blurShader = gradientOrder === 2 ? gradientPrePassShader : blurShaderInput;
   blurShader.use(gl);
   gl.activeTexture(TEXTURE0_BACK_VOL3);
   gl.bindTexture(gl.TEXTURE_3D, volumeTexture);
@@ -39316,7 +39371,7 @@ function gradientGL(params) {
   gl.uniform1f(blurShader.uniforms.dX, blurRadius / hdr.dims[1]);
   gl.uniform1f(blurShader.uniforms.dY, blurRadius / hdr.dims[2]);
   gl.uniform1f(blurShader.uniforms.dZ, blurRadius / hdr.dims[3]);
-  for (let i = 0; i < hdr.dims[3] - 1; i++) {
+  for (let i = 0; i < hdr.dims[3]; i++) {
     const coordZ = 1 / hdr.dims[3] * (i + 0.5);
     gl.uniform1f(blurShader.uniforms.coordZ, coordZ);
     gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, tempTex3D, 0, i);
@@ -39347,7 +39402,7 @@ function gradientGL(params) {
     gl.deleteTexture(gradientTexture);
   }
   gradientTexture = rgbaTex2(gradientTexture, TEXTURE6_GRADIENT, hdr.dims);
-  for (let i = 0; i < hdr.dims[3] - 1; i++) {
+  for (let i = 0; i < hdr.dims[3]; i++) {
     const coordZ = 1 / hdr.dims[3] * (i + 0.5);
     gl.uniform1f(sobelShader.uniforms.coordZ, coordZ);
     gl.framebufferTextureLayer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gradientTexture, 0, i);
@@ -39826,9 +39881,15 @@ function calculateTextWidth(params) {
     return 0;
   }
   let w = 0;
-  const bytes = new TextEncoder().encode(str6);
-  for (let i = 0; i < str6.length; i++) {
-    w += scale6 * fontMets.mets[bytes[i]].xadv;
+  for (const char of str6) {
+    const codePoint = char.codePointAt(0);
+    const metric = fontMets.mets[codePoint];
+    if (!metric) {
+      console.warn(`calculateTextWidth() : Missing font metric for code point ${codePoint} in string "${str6}"`);
+      continue;
+    } else {
+      w += scale6 * metric.xadv;
+    }
   }
   return w;
 }
@@ -39837,11 +39898,15 @@ function calculateTextHeight(params) {
   if (!str6) {
     return 0;
   }
-  const byteSet = new Set(Array.from(str6));
-  const bytes = new TextEncoder().encode(Array.from(byteSet).join(""));
-  const tallest = Object.values(fontMets.mets).filter((_, index) => bytes.includes(index)).reduce((a, b) => a.lbwh[3] > b.lbwh[3] ? a : b);
-  const height = tallest.lbwh[3];
-  return scale6 * height;
+  let maxH = 0;
+  for (const char of str6) {
+    const codePoint = char.codePointAt(0);
+    const metric = fontMets.mets[codePoint];
+    if (metric?.lbwh?.[3] > maxH) {
+      maxH = metric.lbwh[3];
+    }
+  }
+  return scale6 * maxH;
 }
 function calculateTextBelowPosition(params, getTextWidth) {
   const { xy, str: str6, fontPx, canvasWidth } = params;
@@ -43499,7 +43564,7 @@ var Niivue = class extends EventTarget {
     __publicField(this, "orientShaderPAQD", null);
     __publicField(this, "surfaceShader", null);
     __publicField(this, "blurShader", null);
-    __publicField(this, "sobelBlurShader", null);
+    __publicField(this, "gradientPrePassShader", null);
     __publicField(this, "sobelFirstOrderShader", null);
     __publicField(this, "sobelSecondOrderShader", null);
     __publicField(this, "genericVAO", null);
@@ -46304,7 +46369,7 @@ var Niivue = class extends EventTarget {
       this.createEmptyDrawing();
     }
     const result = applyOtsuToDrawing({
-      img: this.volumes[0].img,
+      img: this.volumes[0].img2RAS(),
       drawBitmap: this.drawBitmap,
       thresholds
     });
@@ -46743,9 +46808,7 @@ var Niivue = class extends EventTarget {
     if (this.scene.renderAzimuth === rotation.azimuth && this.scene.renderElevation === rotation.elevation) {
       return;
     }
-    this.scene.renderAzimuth = rotation.azimuth;
-    this.scene.renderElevation = rotation.elevation;
-    this.drawScene();
+    this.setRenderAzimuthElevation(rotation.azimuth, rotation.elevation);
   }
   /**
    * convert spherical AZIMUTH, ELEVATION to Cartesian
@@ -48516,18 +48579,18 @@ var Niivue = class extends EventTarget {
       size: this.fontMetrics.atlas.size,
       mets: {}
     };
-    for (let id = 0; id < 256; id++) {
-      this.fontMets.mets[id] = {
-        xadv: 0,
-        uv_lbwh: [0, 0, 0, 0],
-        lbwh: [0, 0, 0, 0]
-      };
-    }
     const scaleW = this.fontMetrics.atlas.width;
     const scaleH = this.fontMetrics.atlas.height;
     for (let i = 0; i < this.fontMetrics.glyphs.length; i++) {
       const glyph = this.fontMetrics.glyphs[i];
       const id = glyph.unicode;
+      if (!this.fontMets.mets[id]) {
+        this.fontMets.mets[id] = {
+          xadv: 0,
+          uv_lbwh: [0, 0, 0, 0],
+          lbwh: [0, 0, 0, 0]
+        };
+      }
       this.fontMets.mets[id].xadv = glyph.advance;
       if (glyph.planeBounds === void 0) {
         continue;
@@ -48800,7 +48863,7 @@ var Niivue = class extends EventTarget {
     this.colorbarShader = initColorbarShader(gl);
     const imageProcessingShaders = initImageProcessingShaders(gl);
     this.blurShader = imageProcessingShaders.blurShader;
-    this.sobelBlurShader = imageProcessingShaders.sobelBlurShader;
+    this.gradientPrePassShader = imageProcessingShaders.gradientPrePassShader;
     this.sobelFirstOrderShader = imageProcessingShaders.sobelFirstOrderShader;
     this.sobelSecondOrderShader = imageProcessingShaders.sobelSecondOrderShader;
     this.growCutShader = imageProcessingShaders.growCutShader;
@@ -48845,7 +48908,7 @@ var Niivue = class extends EventTarget {
       gradientTexture: this.gradientTexture,
       gradientOrder: this.opts.gradientOrder,
       blurShader: this.blurShader,
-      sobelBlurShader: this.sobelBlurShader,
+      gradientPrePassShader: this.gradientPrePassShader,
       sobelFirstOrderShader: this.sobelFirstOrderShader,
       sobelSecondOrderShader: this.sobelSecondOrderShader,
       rgbaTex: this.rgbaTex.bind(this)
@@ -49259,7 +49322,7 @@ var Niivue = class extends EventTarget {
         gradientTexture: this.gradientTexture,
         gradientOrder: this.opts.gradientOrder,
         blurShader: this.blurShader,
-        sobelBlurShader: this.sobelBlurShader,
+        gradientPrePassShader: this.gradientPrePassShader,
         sobelFirstOrderShader: this.sobelFirstOrderShader,
         sobelSecondOrderShader: this.sobelSecondOrderShader,
         rgbaTex: this.rgbaTex.bind(this)
@@ -51023,15 +51086,20 @@ var Niivue = class extends EventTarget {
       throw new Error("fontShader undefined");
     }
     const metrics = this.fontMets.mets[char];
-    const l = xy[0] + scale6 * metrics.lbwh[0];
-    const b = -(scale6 * metrics.lbwh[1]);
-    const w = scale6 * metrics.lbwh[2];
-    const h = scale6 * metrics.lbwh[3];
-    const t = xy[1] + (b - h) + scale6;
-    this.gl.uniform4f(this.fontShader.uniforms.leftTopWidthHeight, l, t, w, h);
-    this.gl.uniform4fv(this.fontShader.uniforms.uvLeftTopWidthHeight, metrics.uv_lbwh);
-    this.gl.drawArrays(this.gl.TRIANGLE_STRIP, 0, 4);
-    return scale6 * metrics.xadv;
+    if (!metrics) {
+      console.warn(`drawChar() : Missing font metric for char : "${char}"`);
+      return 0;
+    } else {
+      const l = xy[0] + scale6 * metrics.lbwh[0];
+      const b = -(scale6 * metrics.lbwh[1]);
+      const w = scale6 * metrics.lbwh[2];
+      const h = scale6 * metrics.lbwh[3];
+      const t = xy[1] + (b - h) + scale6;
+      this.gl.uniform4f(this.fontShader.uniforms.leftTopWidthHeight, l, t, w, h);
+      this.gl.uniform4fv(this.fontShader.uniforms.uvLeftTopWidthHeight, metrics.uv_lbwh);
+      this.gl.drawArrays(this.gl.TRIANGLE_STRIP, 0, 4);
+      return scale6 * metrics.xadv;
+    }
   }
   /**
    * Render loading text centered on the canvas.
@@ -51074,10 +51142,10 @@ var Niivue = class extends EventTarget {
     let screenPxRange = size / this.fontMets.size * this.fontMets.distanceRange;
     screenPxRange = Math.max(screenPxRange, 1);
     this.gl.uniform1f(this.fontShader.uniforms.screenPxRange, screenPxRange);
-    const bytes = new TextEncoder().encode(str6);
     this.gl.bindVertexArray(this.genericVAO);
-    for (let i = 0; i < str6.length; i++) {
-      xy[0] += this.drawChar(xy, size, bytes[i]);
+    for (const char of str6) {
+      const codePoint = char.codePointAt(0);
+      xy[0] += this.drawChar(xy, size, codePoint);
     }
     this.gl.bindVertexArray(this.unusedVAO);
   }
@@ -53369,6 +53437,7 @@ var Niivue = class extends EventTarget {
         if (this.opts.isColorbar) {
           this.drawColorbar();
         }
+        this.drawAnchoredLabels();
         return;
       }
       this.drawLoadingText(this.opts.loadingText);
@@ -53410,6 +53479,7 @@ var Niivue = class extends EventTarget {
       if (this.opts.isColorbar) {
         this.drawColorbar();
       }
+      this.drawAnchoredLabels();
       return;
     }
     if (this.opts.isColorbar) {
@@ -53672,6 +53742,10 @@ var Niivue = class extends EventTarget {
     posString = pos[0].toFixed(2) + "\xD7" + pos[1].toFixed(2) + "\xD7" + pos[2].toFixed(2);
     this.readyForSync = true;
     this.sync();
+    const has3DTile = this.screenSlices.some((s) => s.axCorSag === 4 /* RENDER */);
+    if (!has3DTile) {
+      this.draw3DLabels(mat4_exports.create(), [0, 0, 0, 0], true);
+    }
     this.drawAnchoredLabels();
     this.drawBoundsBorder();
     return posString;
@@ -53746,22 +53820,9 @@ var Niivue = class extends EventTarget {
    * @internal
    */
   async loadPngAsTexture(pngUrl, textureNum) {
-    const texture = await loadPngAsTexture(
-      this.gl,
-      pngUrl,
-      textureNum,
-      this.fontShader,
-      this.bmpShader,
-      this.fontTexture,
-      this.bmpTexture,
-      this.matCapTexture,
-      (widthHeightRatio) => {
-        this.bmpTextureWH = widthHeightRatio;
-      },
-      () => {
-        this.drawScene();
-      }
-    );
+    const texture = await loadPngAsTexture(this.gl, pngUrl, textureNum, this.fontShader, this.bmpShader, this.fontTexture, this.bmpTexture, this.matCapTexture, (widthHeightRatio) => {
+      this.bmpTextureWH = widthHeightRatio;
+    });
     if (textureNum === 3) {
       this.fontTexture = texture;
     } else if (textureNum === 4) {
@@ -53769,6 +53830,7 @@ var Niivue = class extends EventTarget {
     } else if (textureNum === 5) {
       this.matCapTexture = texture;
     }
+    this.drawScene();
     return texture;
   }
   /**
